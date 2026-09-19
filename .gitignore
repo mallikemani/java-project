@@ -1,0 +1,44 @@
+# Maven build output
+target/
+
+# IDEs and operating system files
+.idea/
+*.iml
+.vscode/
+.classpath
+.project
+.settings/
+.DS_Store
+Thumbs.db
+
+# Local-only configuration, logs and secrets
+.env
+.env.*
+!.env.example
+*.log
+*.pid
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+settings-local.xml
+
+# Terraform local files, for later phases
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfvars
+!*.tfvars.example
+# Commit .terraform.lock.hcl when Terraform is introduced.
+
+# Local build outputs and private machine files
+/target/
+.DS_Store
+*.log
+.env
+.env.*
+!.env.example
+*.pem
+*.key

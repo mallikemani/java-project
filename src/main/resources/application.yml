@@ -1,0 +1,44 @@
+spring:
+  application:
+    name: release-tracker
+  lifecycle:
+    timeout-per-shutdown-phase: 20s
+
+server:
+  # Local-only by default. In the container phase we will explain and change this.
+  address: ${SERVER_ADDRESS:127.0.0.1}
+  port: ${SERVER_PORT:8080}
+  shutdown: graceful
+  error:
+    include-message: never
+    include-stacktrace: never
+    include-binding-errors: never
+
+app:
+  # Maven replaces @project.version@ at build time; this is not an environment label.
+  version: '@project.version@'
+  environment: ${APP_ENV:local}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      show-details: never
+  info:
+    env:
+      enabled: true
+
+info:
+  app:
+    name: release-tracker
+    version: '@project.version@'
+    environment: ${APP_ENV:local}
+    storage: in-memory
+
+logging:
+  level:
+    root: INFO
+    com.mallikraja.releasetracker: ${APP_LOG_LEVEL:INFO}

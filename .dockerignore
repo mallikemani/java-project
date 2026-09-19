@@ -1,0 +1,6 @@
+*
+!Dockerfile
+!.dockerignore
+!target/
+target/*
+!target/release-tracker-0.1.0-SNAPSHOT.jar
