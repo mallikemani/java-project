@@ -1,0 +1,195 @@
+name: Publish to ECR
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ecr-publish-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-west-2
+  AWS_ACCOUNT_ID: '513594860053'
+  ECR_REPOSITORY: release-tracker
+
+jobs:
+  publish:
+    name: Test, smoke-test and publish
+    if: github.repository == 'mallikemani/java-project' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1, existing CI pin
+        with:
+          persist-credentials: false
+
+      - name: Set up Java 21
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1, existing CI pin
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Test and package
+        run: ./mvnw --batch-mode --no-transfer-progress clean package
+
+      - name: Select a unique, traceable image tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          IMAGE_TAG="sha-${GITHUB_SHA}-run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "ECR_REGISTRY=${REGISTRY}" >> "$GITHUB_ENV"
+          echo "IMAGE_TAG=${IMAGE_TAG}" >> "$GITHUB_ENV"
+          echo "IMAGE_URI=${REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}" >> "$GITHUB_ENV"
+
+      - name: Build the deployment image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build --pull --platform linux/amd64 \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --tag "$IMAGE_URI" .
+
+      - name: Smoke-test the exact image before publishing
+        shell: bash
+        run: |
+          set -euo pipefail
+          cleanup() {
+            docker logs release-tracker-ci || true
+            docker rm --force release-tracker-ci >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          docker run --detach --name release-tracker-ci \
+            --publish 127.0.0.1:8080:8080 "$IMAGE_URI"
+
+          ready=false
+          for attempt in {1..30}; do
+            if curl --fail --silent --max-time 3 \
+              http://127.0.0.1:8080/actuator/health \
+              --output /tmp/release-tracker-health.json; then
+              ready=true
+              break
+            fi
+            sleep 2
+          done
+          if [ "$ready" != true ]; then
+            echo 'Application did not become healthy within the startup window.' >&2
+            exit 1
+          fi
+          python3 -c 'import json; d=json.load(open("/tmp/release-tracker-health.json")); assert d.get("status")=="UP", d'
+
+          status=$(curl --silent --show-error --max-time 10 \
+            --output /tmp/release-tracker-created.json --write-out '%{http_code}' \
+            --request POST http://127.0.0.1:8080/api/releases \
+            --header 'Content-Type: application/json' \
+            --data '{"applicationName":"ci-smoke-test","version":"0.1.0-SNAPSHOT","environment":"DEV","status":"DEPLOYED"}')
+          if [ "$status" != 201 ]; then
+            cat /tmp/release-tracker-created.json
+            echo "Expected HTTP 201; received ${status}." >&2
+            exit 1
+          fi
+          curl --fail --silent --show-error --max-time 10 \
+            http://127.0.0.1:8080/api/releases \
+            --output /tmp/release-tracker-listed.json
+          python3 - <<'PYCODE'
+          import json
+          created = json.load(open('/tmp/release-tracker-created.json'))
+          listed = json.load(open('/tmp/release-tracker-listed.json'))
+          assert created.get('applicationName') == 'ci-smoke-test', created
+          assert created.get('id'), created
+          assert any(item.get('id') == created['id'] for item in listed), listed
+          print('Container health and create/read smoke tests passed.')
+          PYCODE
+
+      - name: Check the non-secret OIDC subject before AWS authentication
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYCODE'
+          import base64
+          import json
+          import os
+          import urllib.parse
+          import urllib.request
+          request_url = os.environ['ACTIONS_ID_TOKEN_REQUEST_URL']
+          separator = '&' if '?' in request_url else '?'
+          request_url += separator + urllib.parse.urlencode({'audience': 'sts.amazonaws.com'})
+          request = urllib.request.Request(request_url, headers={
+              'Authorization': 'Bearer ' + os.environ['ACTIONS_ID_TOKEN_REQUEST_TOKEN']
+          })
+          with urllib.request.urlopen(request, timeout=30) as response:
+              token = json.load(response)['value']
+          payload = token.split('.')[1]
+          claims = json.loads(base64.urlsafe_b64decode(payload + '=' * (-len(payload) % 4)))
+          expected = 'repo:mallikemani@73798184/java-project@1377604220:ref:refs/heads/main'
+          # Diagnostic only: AWS STS, not this decoder, verifies token authenticity.
+          # Never print the JWT or the GitHub request token.
+          print('OIDC subject:', claims.get('sub'))
+          print('OIDC audience:', claims.get('aud'))
+          if claims.get('sub') != expected or claims.get('aud') != 'sts.amazonaws.com':
+              raise SystemExit('OIDC claims do not match our trust policy. Inspect these two claims; do not widen trust with a wildcard.')
+          PYCODE
+
+      - name: Obtain temporary AWS credentials through OIDC
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: arn:aws:iam::513594860053:role/release-tracker-github-ecr-publish
+          role-session-name: gha-${{ github.run_id }}-${{ github.run_attempt }}
+          role-duration-seconds: 900
+          allowed-account-ids: '513594860053'
+          unset-current-credentials: true
+          retry-max-attempts: 4
+          action-timeout-s: 120
+
+      - name: Verify the assumed AWS identity
+        run: aws sts get-caller-identity --no-cli-pager
+
+      - name: Log Docker into the private ECR registry
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws ecr get-login-password --region "$AWS_REGION" \
+            | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+
+      - name: Push the image and record its digest
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker push "$IMAGE_URI"
+          DIGEST=$(aws ecr describe-images \
+            --region "$AWS_REGION" \
+            --repository-name "$ECR_REPOSITORY" \
+            --image-ids "imageTag=${IMAGE_TAG}" \
+            --query 'imageDetails[0].imageDigest' \
+            --output text --no-cli-pager)
+          if [[ "$DIGEST" != sha256:* ]]; then
+            echo "Invalid or missing ECR digest: ${DIGEST}" >&2
+            exit 1
+          fi
+          {
+            echo '## Published image'
+            printf '\nSource commit: `%s`\n' "$GITHUB_SHA"
+            printf '\nImage tag: `%s`\n' "$IMAGE_URI"
+            printf '\nDeployable digest: `%s/%s@%s`\n' "$ECR_REGISTRY" "$ECR_REPOSITORY" "$DIGEST"
+            printf '\nPlatform: `linux/amd64`\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove Docker registry login from the runner
+        if: always()
+        shell: bash
+        run: |
+          if [ -n "${ECR_REGISTRY:-}" ]; then
+            docker logout "$ECR_REGISTRY" || true
+          fi
